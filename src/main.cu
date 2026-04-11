@@ -57,13 +57,16 @@ struct Params {
     bool input_is_clean = true;
     std::string ref_path;
     std::string output_prefix = "output";
-    std::string noise_model = "gaussian";
     float noise_stddev = 15.0f;
+    float noise_sigma = -1.0f;
     float salt_pepper_ratio = 0.01f;
+    bool auto_tune = true;
     int median_radius = 1;
     int nlm_patch_radius = 1;
     int nlm_search_radius = 3;
-    float nlm_h = 12.0f;
+    float nlm_h = 0.0f;
+    float nlm_h_factor = 0.9f;
+    bool rician_bias_correction = true;
     float sharpen_amount = 0.0f;
     bool gpu_metrics = true;
 };
@@ -218,30 +221,92 @@ void write_pgm(const std::string& path, const Image& img) {
     out.write(reinterpret_cast<const char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
 }
 
-Image add_noise(const Image& clean, const std::string& model, float stddev,
+float median_inplace(std::vector<float>& vals) {
+    if (vals.empty()) {
+        return 0.0f;
+    }
+    const size_t mid = vals.size() / 2;
+    std::nth_element(vals.begin(), vals.begin() + mid, vals.end());
+    return vals[mid];
+}
+
+float estimate_noise_sigma_mad(const Image& img) {
+    if (img.width < 3 || img.height < 3) {
+        return 0.0f;
+    }
+
+    const int w = img.width;
+    const int h = img.height;
+    std::vector<float> abs_residuals;
+    abs_residuals.reserve(static_cast<size_t>(w - 2) * static_cast<size_t>(h - 2));
+
+    for (int y = 1; y < h - 1; ++y) {
+        for (int x = 1; x < w - 1; ++x) {
+            const float c = img.pixels[static_cast<size_t>(y) * w + x];
+            const float l = img.pixels[static_cast<size_t>(y) * w + (x - 1)];
+            const float r = img.pixels[static_cast<size_t>(y) * w + (x + 1)];
+            const float u = img.pixels[static_cast<size_t>(y - 1) * w + x];
+            const float d = img.pixels[static_cast<size_t>(y + 1) * w + x];
+
+            // 4-neighbor Laplacian response is robust for white-noise variance estimation.
+            const float lap = l + r + u + d - 4.0f * c;
+            abs_residuals.push_back(std::abs(lap));
+        }
+    }
+
+    const float med_abs = median_inplace(abs_residuals);
+    const float normal_quantile_75 = 0.67448975f;
+    const float lap_gain = std::sqrt(20.0f);
+    const float sigma = med_abs / std::max(1e-6f, normal_quantile_75 * lap_gain);
+    return std::max(0.0f, sigma);
+}
+
+void tune_pipeline_params(const Params& params, float sigma,
+                          int* median_radius, int* patch_radius, int* search_radius, float* nlm_h) {
+    if (!median_radius || !patch_radius || !search_radius || !nlm_h) {
+        throw std::runtime_error("Internal error: null parameter passed to tune_pipeline_params");
+    }
+
+    *median_radius = params.median_radius;
+    *patch_radius = params.nlm_patch_radius;
+    *search_radius = params.nlm_search_radius;
+    *nlm_h = params.nlm_h;
+
+    if (*nlm_h <= 0.0f) {
+        *nlm_h = std::max(6.0f, params.nlm_h_factor * sigma);
+    }
+
+    if (!params.auto_tune) {
+        return;
+    }
+
+    if (sigma > 30.0f) {
+        *median_radius = std::max(*median_radius, 3);
+        *patch_radius = std::max(*patch_radius, 2);
+        *search_radius = std::max(*search_radius, 5);
+    } else if (sigma > 20.0f) {
+        *median_radius = std::max(*median_radius, 2);
+        *patch_radius = std::max(*patch_radius, 2);
+        *search_radius = std::max(*search_radius, 4);
+    } else if (sigma > 14.0f) {
+        *search_radius = std::max(*search_radius, 4);
+    }
+
+    *median_radius = clamp_int(*median_radius, 1, 3);
+    *patch_radius = std::max(1, *patch_radius);
+    *search_radius = std::max(1, *search_radius);
+    *nlm_h = std::max(1e-3f, *nlm_h);
+}
+
+Image add_noise(const Image& clean, float stddev,
                 float salt_pepper_ratio, uint32_t seed = 42) {
     Image noisy = clean;
     std::mt19937 gen(seed);
     std::normal_distribution<float> gauss(0.0f, stddev);
     std::uniform_real_distribution<float> uni(0.0f, 1.0f);
-    const std::string m = to_lower(model);
-
-    if (m != "gaussian" && m != "rician") {
-        throw std::runtime_error("Unsupported --noise-model. Use gaussian or rician.");
-    }
 
     for (float& p : noisy.pixels) {
-        float v = 0.0f;
-        if (m == "rician") {
-            // MRI magnitude reconstruction is commonly modeled with Rician noise.
-            float n1 = gauss(gen);
-            float n2 = gauss(gen);
-            float x = p + n1;
-            float y = n2;
-            v = std::sqrt(x * x + y * y);
-        } else {
-            v = p + gauss(gen);
-        }
+        float v = p + gauss(gen);
         if (uni(gen) < salt_pepper_ratio) {
             v = (uni(gen) < 0.5f) ? 0.0f : kPixelMax;
         }
@@ -319,7 +384,8 @@ Image median_filter_cpu(const Image& in, int radius) {
     return out;
 }
 
-Image nlm_filter_cpu(const Image& in, int patch_radius, int search_radius, float h_param) {
+Image nlm_filter_cpu(const Image& in, int patch_radius, int search_radius, float h_param,
+                     bool rician_bias_correction, float noise_sigma) {
     Image out;
     out.width = in.width;
     out.height = in.height;
@@ -327,11 +393,13 @@ Image nlm_filter_cpu(const Image& in, int patch_radius, int search_radius, float
 
     const int w = in.width;
     const int h = in.height;
-    const float h2 = h_param * h_param;
+    const float h2 = std::max(1e-6f, h_param * h_param);
+    const float noise_bias = 2.0f * noise_sigma * noise_sigma;
 
     for (int y = 0; y < h; ++y) {
         for (int x = 0; x < w; ++x) {
             float weighted_sum = 0.0f;
+            float weighted_sum_sq = 0.0f;
             float weight_acc = 0.0f;
 
             for (int sy = -search_radius; sy <= search_radius; ++sy) {
@@ -353,13 +421,24 @@ Image nlm_filter_cpu(const Image& in, int patch_radius, int search_radius, float
                     }
 
                     float wgt = std::exp(-patch_dist / h2);
-                    weighted_sum += wgt * in.pixels[static_cast<size_t>(qy) * w + qx];
+                    float sample = in.pixels[static_cast<size_t>(qy) * w + qx];
+                    weighted_sum += wgt * sample;
+                    weighted_sum_sq += wgt * sample * sample;
                     weight_acc += wgt;
                 }
             }
 
-            out.pixels[static_cast<size_t>(y) * w + x] =
-                (weight_acc > 1e-8f) ? (weighted_sum / weight_acc) : in.pixels[static_cast<size_t>(y) * w + x];
+            const float center = in.pixels[static_cast<size_t>(y) * w + x];
+            float denoised = center;
+            if (weight_acc > 1e-8f) {
+                if (rician_bias_correction) {
+                    float sq = (weighted_sum_sq / weight_acc) - noise_bias;
+                    denoised = std::sqrt(std::max(0.0f, sq));
+                } else {
+                    denoised = weighted_sum / weight_acc;
+                }
+            }
+            out.pixels[static_cast<size_t>(y) * w + x] = clamp_float(denoised, 0.0f, kPixelMax);
         }
     }
 
@@ -419,15 +498,17 @@ __global__ void median_filter_kernel(const float* in, float* out, int w, int h, 
 }
 
 __global__ void nlm_filter_kernel(const float* in, float* out, int w, int h, int patch_radius,
-                                  int search_radius, float h_param) {
+                                  int search_radius, float h_param, int rician_bias_correction,
+                                  float noise_bias) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) {
         return;
     }
 
-    const float h2 = h_param * h_param;
+    const float h2 = fmaxf(1e-6f, h_param * h_param);
     float weighted_sum = 0.0f;
+    float weighted_sum_sq = 0.0f;
     float weight_acc = 0.0f;
 
     for (int sy = -search_radius; sy <= search_radius; ++sy) {
@@ -448,17 +529,29 @@ __global__ void nlm_filter_kernel(const float* in, float* out, int w, int h, int
             }
 
             float wgt = expf(-patch_dist / h2);
-            weighted_sum += wgt * in[qy * w + qx];
+            float sample = in[qy * w + qx];
+            weighted_sum += wgt * sample;
+            weighted_sum_sq += wgt * sample * sample;
             weight_acc += wgt;
         }
     }
 
-    out[y * w + x] = (weight_acc > 1e-8f) ? (weighted_sum / weight_acc) : in[y * w + x];
+    float denoised = in[y * w + x];
+    if (weight_acc > 1e-8f) {
+        if (rician_bias_correction) {
+            const float sq = (weighted_sum_sq / weight_acc) - noise_bias;
+            denoised = sqrtf(fmaxf(0.0f, sq));
+        } else {
+            denoised = weighted_sum / weight_acc;
+        }
+    }
+    out[y * w + x] = fminf(kPixelMax, fmaxf(0.0f, denoised));
 }
 
 __global__ void nlm_filter_kernel_shared(const float* in, float* out, int w, int h,
                                          int patch_radius, int search_radius,
-                                         int total_radius, float h_param) {
+                                         int total_radius, float h_param,
+                                         int rician_bias_correction, float noise_bias) {
     extern __shared__ float tile[];
 
     const int tx = threadIdx.x;
@@ -482,8 +575,9 @@ __global__ void nlm_filter_kernel_shared(const float* in, float* out, int w, int
         return;
     }
 
-    const float h2 = h_param * h_param;
+    const float h2 = fmaxf(1e-6f, h_param * h_param);
     float weighted_sum = 0.0f;
+    float weighted_sum_sq = 0.0f;
     float weight_acc = 0.0f;
 
     const int center_x = tx + total_radius;
@@ -502,12 +596,23 @@ __global__ void nlm_filter_kernel_shared(const float* in, float* out, int w, int
             }
 
             float wgt = expf(-patch_dist / h2);
-            weighted_sum += wgt * tile[(center_y + sy) * tile_w + (center_x + sx)];
+            float sample = tile[(center_y + sy) * tile_w + (center_x + sx)];
+            weighted_sum += wgt * sample;
+            weighted_sum_sq += wgt * sample * sample;
             weight_acc += wgt;
         }
     }
 
-    out[gy * w + gx] = (weight_acc > 1e-8f) ? (weighted_sum / weight_acc) : in[gy * w + gx];
+    float denoised = in[gy * w + gx];
+    if (weight_acc > 1e-8f) {
+        if (rician_bias_correction) {
+            const float sq = (weighted_sum_sq / weight_acc) - noise_bias;
+            denoised = sqrtf(fmaxf(0.0f, sq));
+        } else {
+            denoised = weighted_sum / weight_acc;
+        }
+    }
+    out[gy * w + gx] = fminf(kPixelMax, fmaxf(0.0f, denoised));
 }
 
 __global__ void mse_partial_reduce_kernel(const float* a, const float* b, size_t n, float* partial) {
@@ -596,6 +701,7 @@ Image median_filter_gpu(const Image& in, int radius, double* kernel_ms, double* 
 }
 
 Image nlm_filter_gpu(const Image& in, int patch_radius, int search_radius, float h_param,
+                     bool rician_bias_correction, float noise_sigma,
                      double* kernel_ms, double* total_ms) {
     Image out;
     out.width = in.width;
@@ -621,6 +727,8 @@ Image nlm_filter_gpu(const Image& in, int patch_radius, int search_radius, float
     dim3 block(16, 16);
     dim3 grid((in.width + block.x - 1) / block.x, (in.height + block.y - 1) / block.y);
     const int total_radius = patch_radius + search_radius;
+    const int rician_flag = rician_bias_correction ? 1 : 0;
+    const float noise_bias = 2.0f * noise_sigma * noise_sigma;
 
     int dev = 0;
     CUDA_CHECK(cudaGetDevice(&dev));
@@ -635,10 +743,11 @@ Image nlm_filter_gpu(const Image& in, int patch_radius, int search_radius, float
     CUDA_CHECK(cudaEventRecord(start_kernel));
     if (use_shared) {
         nlm_filter_kernel_shared<<<grid, block, nlm_shmem_bytes>>>(
-            d_in, d_out, in.width, in.height, patch_radius, search_radius, total_radius, h_param);
+            d_in, d_out, in.width, in.height, patch_radius, search_radius, total_radius, h_param,
+            rician_flag, noise_bias);
     } else {
         nlm_filter_kernel<<<grid, block>>>(d_in, d_out, in.width, in.height, patch_radius,
-                                           search_radius, h_param);
+                                           search_radius, h_param, rician_flag, noise_bias);
     }
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(stop_kernel));
@@ -830,13 +939,16 @@ void print_usage(const char* prog) {
               << "  --input-is-clean <0|1>    Treat --input as clean image (1, default) or noisy image (0)\n"
               << "  --ref <clean_reference>    Optional clean reference image for quality metrics\n"
               << "  --output-prefix <name>    Output prefix (default: output)\n"
-              << "  --noise-model <name>      gaussian or rician (default: gaussian)\n"
               << "  --noise-std <float>       Gaussian noise stddev (used when --input-is-clean=1, default: 15)\n"
+              << "  --noise-sigma <float>     Known noise sigma for denoising; <=0 means auto estimate\n"
               << "  --sp-ratio <float>        Salt-pepper probability (used when --input-is-clean=1, default: 0.01)\n"
+              << "  --auto-tune <0|1>         Auto-tune median/NLM params using estimated noise (default: 1)\n"
               << "  --median-radius <int>     Median radius, max 3 (default: 1)\n"
               << "  --nlm-patch <int>         NLM patch radius (default: 1)\n"
               << "  --nlm-search <int>        NLM search radius (default: 3)\n"
-              << "  --nlm-h <float>           NLM filtering strength (default: 12)\n"
+              << "  --nlm-h <float>           NLM filtering strength; <=0 means auto from sigma\n"
+              << "  --nlm-h-factor <float>    Auto NLM strength factor h=factor*sigma (default: 0.9)\n"
+              << "  --rician-bias-correct <0|1>  Bias-correct NLM for MRI-like Rician noise (default: 1)\n"
               << "  --sharpen-amount <float>  Unsharp-mask amount on denoised outputs (default: 0)\n"
               << "  --gpu-metrics <0|1>       Use GPU MSE reduction for PSNR (default: 1)\n";
 }
@@ -864,12 +976,18 @@ Params parse_args(int argc, char** argv) {
             p.ref_path = require_value(a);
         } else if (a == "--output-prefix") {
             p.output_prefix = require_value(a);
-        } else if (a == "--noise-model") {
-            p.noise_model = to_lower(require_value(a));
         } else if (a == "--noise-std") {
             p.noise_stddev = std::stof(require_value(a));
+        } else if (a == "--noise-sigma") {
+            p.noise_sigma = std::stof(require_value(a));
         } else if (a == "--sp-ratio") {
             p.salt_pepper_ratio = std::stof(require_value(a));
+        } else if (a == "--auto-tune") {
+            int v = std::stoi(require_value(a));
+            if (v != 0 && v != 1) {
+                throw std::runtime_error("--auto-tune must be 0 or 1");
+            }
+            p.auto_tune = (v == 1);
         } else if (a == "--median-radius") {
             p.median_radius = std::stoi(require_value(a));
         } else if (a == "--nlm-patch") {
@@ -878,6 +996,14 @@ Params parse_args(int argc, char** argv) {
             p.nlm_search_radius = std::stoi(require_value(a));
         } else if (a == "--nlm-h") {
             p.nlm_h = std::stof(require_value(a));
+        } else if (a == "--nlm-h-factor") {
+            p.nlm_h_factor = std::stof(require_value(a));
+        } else if (a == "--rician-bias-correct") {
+            int v = std::stoi(require_value(a));
+            if (v != 0 && v != 1) {
+                throw std::runtime_error("--rician-bias-correct must be 0 or 1");
+            }
+            p.rician_bias_correction = (v == 1);
         } else if (a == "--sharpen-amount") {
             p.sharpen_amount = std::stof(require_value(a));
         } else if (a == "--gpu-metrics") {
@@ -897,17 +1023,14 @@ Params parse_args(int argc, char** argv) {
     if (p.input_path.empty()) {
         throw std::runtime_error("--input is required");
     }
-    if (p.noise_model != "gaussian" && p.noise_model != "rician") {
-        throw std::runtime_error("--noise-model must be gaussian or rician");
-    }
     if (p.median_radius < 1 || p.median_radius > 3) {
         throw std::runtime_error("--median-radius must be in [1, 3]");
     }
     if (p.nlm_patch_radius < 1 || p.nlm_search_radius < 1) {
         throw std::runtime_error("NLM radii must be >= 1");
     }
-    if (p.nlm_h <= 0.0f) {
-        throw std::runtime_error("--nlm-h must be > 0");
+    if (p.nlm_h_factor <= 0.0f) {
+        throw std::runtime_error("--nlm-h-factor must be > 0");
     }
     if (p.sharpen_amount < 0.0f) {
         throw std::runtime_error("--sharpen-amount must be >= 0");
@@ -951,7 +1074,7 @@ int main(int argc, char** argv) {
 
         if (params.input_is_clean) {
             clean_ref = input_img;
-            noisy = add_noise(clean_ref, params.noise_model, params.noise_stddev, params.salt_pepper_ratio);
+            noisy = add_noise(clean_ref, params.noise_stddev, params.salt_pepper_ratio);
             has_ref = true;
         } else {
             noisy = input_img;
@@ -965,24 +1088,49 @@ int main(int argc, char** argv) {
             }
         }
 
+        float estimated_sigma = params.noise_sigma;
+        if (estimated_sigma <= 0.0f) {
+            if (params.input_is_clean) {
+                estimated_sigma = params.noise_stddev;
+            } else {
+                estimated_sigma = estimate_noise_sigma_mad(noisy);
+            }
+        }
+        if (!std::isfinite(estimated_sigma) || estimated_sigma <= 0.0f) {
+            estimated_sigma = std::max(5.0f, params.noise_stddev);
+        }
+
+        int effective_median_radius = params.median_radius;
+        int effective_patch_radius = params.nlm_patch_radius;
+        int effective_search_radius = params.nlm_search_radius;
+        float effective_nlm_h = params.nlm_h;
+        tune_pipeline_params(params, estimated_sigma,
+                             &effective_median_radius, &effective_patch_radius,
+                             &effective_search_radius, &effective_nlm_h);
+
+        const bool likely_rician = !params.input_is_clean;
+        const bool use_rician_bias_correction = params.rician_bias_correction && likely_rician;
+
         auto t0 = std::chrono::high_resolution_clock::now();
-        Image median_cpu = median_filter_cpu(noisy, params.median_radius);
+        Image median_cpu = median_filter_cpu(noisy, effective_median_radius);
         auto t1 = std::chrono::high_resolution_clock::now();
 
         double median_gpu_kernel_ms = 0.0;
         double median_gpu_total_ms = 0.0;
-        Image median_gpu = median_filter_gpu(noisy, params.median_radius,
+        Image median_gpu = median_filter_gpu(noisy, effective_median_radius,
                                              &median_gpu_kernel_ms, &median_gpu_total_ms);
 
         auto t2 = std::chrono::high_resolution_clock::now();
-        Image nlm_cpu = nlm_filter_cpu(median_cpu, params.nlm_patch_radius,
-                                       params.nlm_search_radius, params.nlm_h);
+        Image nlm_cpu = nlm_filter_cpu(median_cpu, effective_patch_radius,
+                           effective_search_radius, effective_nlm_h,
+                           use_rician_bias_correction, estimated_sigma);
         auto t3 = std::chrono::high_resolution_clock::now();
 
         double nlm_gpu_kernel_ms = 0.0;
         double nlm_gpu_total_ms = 0.0;
-        Image nlm_gpu = nlm_filter_gpu(median_gpu, params.nlm_patch_radius,
-                                       params.nlm_search_radius, params.nlm_h,
+        Image nlm_gpu = nlm_filter_gpu(median_gpu, effective_patch_radius,
+                           effective_search_radius, effective_nlm_h,
+                           use_rician_bias_correction, estimated_sigma,
                                        &nlm_gpu_kernel_ms, &nlm_gpu_total_ms);
 
         bool apply_sharpen = params.sharpen_amount > 0.0f;
@@ -1024,6 +1172,13 @@ int main(int argc, char** argv) {
 
         std::cout << "Loaded image: " << noisy.width << "x" << noisy.height << "\n";
         std::cout << std::fixed << std::setprecision(3);
+        std::cout << "Estimated sigma: " << estimated_sigma << "\n";
+        std::cout << "Effective params: median-radius=" << effective_median_radius
+              << ", nlm-patch=" << effective_patch_radius
+              << ", nlm-search=" << effective_search_radius
+              << ", nlm-h=" << effective_nlm_h
+              << ", rician-bias-correct=" << (use_rician_bias_correction ? 1 : 0)
+              << "\n";
         if (has_ref) {
             Metrics noisy_m = evaluate(clean_ref, noisy, params.gpu_metrics);
             Metrics median_cpu_m = evaluate(clean_ref, median_cpu, params.gpu_metrics);

@@ -15,8 +15,11 @@ Core features:
 - Brute-force global-memory kernel
 - Shared-memory accelerated kernel (auto selected when memory fits)
 - Cascaded denoising pipeline: Median output is fed into NLM (CPU and GPU paths)
-- Gaussian and Rician noise synthesis
+- Gaussian noise synthesis for clean-input experiments
 - Optional salt-and-pepper impulse noise
+- Robust noise sigma estimation (MAD on Laplacian response) for real noisy inputs
+- Auto-tuned denoising parameters from estimated sigma
+- Optional Rician bias-corrected NLM reconstruction for MRI-like noisy scans
 - PSNR and SSIM quality metrics
 - Optional GPU-accelerated PSNR using MSE reduction
 - Optional unsharp-mask sharpening post-process
@@ -98,13 +101,17 @@ Basic form:
 - Prefix for generated result images.
 - Default: `output`.
 
-- `--noise-model <gaussian|rician>`
-- Used only when `--input-is-clean=1`.
-- Default: `gaussian`.
-
 - `--noise-std <float>`
-- Standard deviation for Gaussian component.
+- Standard deviation for synthetic Gaussian noise in clean-input mode.
 - Default: `15`.
+
+- `--noise-sigma <float>`
+- Known noise sigma for denoising.
+- Use `<= 0` to auto-estimate from the input image.
+
+- `--auto-tune <0|1>`
+- Auto-tune median/NLM parameters using estimated sigma.
+- Default: `1`.
 
 - `--sp-ratio <float>`
 - Salt-and-pepper probability in `[0,1]`.
@@ -124,7 +131,17 @@ Basic form:
 
 - `--nlm-h <float>`
 - NLM filtering strength parameter.
-- Default: `12`.
+- Use `<= 0` to auto-compute from sigma.
+
+- `--nlm-h-factor <float>`
+- Auto NLM strength factor used when `--nlm-h <= 0`:
+- `h = factor * sigma`.
+- Default: `0.9`.
+
+- `--rician-bias-correct <0|1>`
+- Enables bias correction term in NLM reconstruction.
+- In code, this is enabled for noisy-input mode by default.
+- Default: `1`.
 
 - `--sharpen-amount <float>`
 - Unsharp mask amount after denoising.
@@ -137,19 +154,21 @@ Basic form:
 
 ### 5.2 Example Runs
 
-Clean image input, synthetic Rician noise:
+Clean image input, synthetic Gaussian noise:
 
 ```bash
 ./build/medimg_cuda \
   --input phantom.pgm \
   --input-is-clean 1 \
-  --noise-model rician \
   --noise-std 15 \
   --sp-ratio 0.01 \
+  --noise-sigma 0 \
+  --auto-tune 1 \
   --median-radius 1 \
   --nlm-patch 1 \
   --nlm-search 3 \
-  --nlm-h 12 \
+  --nlm-h 0 \
+  --nlm-h-factor 0.9 \
   --gpu-metrics 1 \
   --output-prefix run1
 ```
@@ -161,10 +180,10 @@ Real noisy input with clean reference:
   --input noisy_slice.png \
   --input-is-clean 0 \
   --ref clean_slice.png \
-  --median-radius 1 \
-  --nlm-patch 1 \
-  --nlm-search 3 \
-  --nlm-h 12 \
+  --noise-sigma 0 \
+  --auto-tune 1 \
+  --nlm-h 0 \
+  --rician-bias-correct 1 \
   --output-prefix mri_case
 ```
 
@@ -200,15 +219,17 @@ Execution order in `main`:
 1. Parse and validate CLI args.
 2. Load input image (PGM or optional stb-backed format).
 3. Decide clean/noisy mode.
-4. If clean mode: synthesize noise (Gaussian or Rician) + optional impulse noise.
-5. Run CPU Median.
-6. Run GPU Median and record timings.
-7. Run CPU NLM on `median_cpu` output.
-8. Run GPU NLM on `median_gpu` output and auto-select shared-memory path if feasible.
-9. Optionally apply unsharp sharpening to outputs.
-10. Save output images.
-11. Compute metrics (PSNR and SSIM) if reference is available.
-12. Print performance and quality reports.
+4. If clean mode: synthesize Gaussian noise + optional impulse noise.
+5. If noisy mode: estimate sigma automatically when `--noise-sigma <= 0`.
+6. Auto-tune effective median/NLM parameters from sigma when enabled.
+7. Run CPU Median.
+8. Run GPU Median and record timings.
+9. Run CPU NLM on `median_cpu` output.
+10. Run GPU NLM on `median_gpu` output and auto-select shared-memory path if feasible.
+11. Optionally apply unsharp sharpening to outputs.
+12. Save output images.
+13. Compute metrics (PSNR and SSIM) if reference is available.
+14. Print performance and quality reports.
 
 ## 8. Function-by-Function Reference
 
@@ -231,6 +252,15 @@ This section maps every major function in `src/main.cu` to purpose and behavior.
 - `file_extension(const std::string& path)`
 - Extracts lowercase extension without dot.
 
+- `median_inplace(std::vector<float>& vals)`
+- Returns median with `std::nth_element`.
+
+- `estimate_noise_sigma_mad(const Image& img)`
+- Robust sigma estimation from median absolute Laplacian response.
+
+- `tune_pipeline_params(...)`
+- Derives effective median/NLM parameters from sigma and CLI settings.
+
 ### 8.2 Image I/O
 
 - `read_pgm(const std::string& path)`
@@ -252,8 +282,8 @@ This section maps every major function in `src/main.cu` to purpose and behavior.
 
 ### 8.3 Noise and Enhancement
 
-- `add_noise(const Image& clean, const std::string& model, float stddev, float salt_pepper_ratio, uint32_t seed)`
-- Adds either Gaussian or Rician noise.
+- `add_noise(const Image& clean, float stddev, float salt_pepper_ratio, uint32_t seed)`
+- Adds Gaussian noise.
 - Optionally injects salt-and-pepper impulse corruption.
 - Uses deterministic PRNG seed by default for reproducibility.
 
@@ -267,9 +297,10 @@ This section maps every major function in `src/main.cu` to purpose and behavior.
 - Per-pixel median over `(2r+1)x(2r+1)` neighborhood.
 - Uses `std::nth_element` to avoid full sort.
 
-- `nlm_filter_cpu(const Image& in, int patch_radius, int search_radius, float h_param)`
+- `nlm_filter_cpu(const Image& in, int patch_radius, int search_radius, float h_param, bool rician_bias_correction, float noise_sigma)`
 - Brute-force NLM.
 - For each pixel, compares local patch with nearby patches and computes weighted average.
+- Supports optional bias-corrected reconstruction using estimated/known sigma.
 - In the current application flow, this function receives the median-filtered image as input.
 
 ### 8.5 CUDA Kernels
@@ -282,11 +313,13 @@ This section maps every major function in `src/main.cu` to purpose and behavior.
 - `nlm_filter_kernel(...)`
 - Global-memory brute-force NLM kernel.
 - Straightforward but memory intensive.
+- Supports optional bias-corrected reconstruction.
 
 - `nlm_filter_kernel_shared(...)`
 - Shared-memory accelerated NLM kernel.
 - Loads a larger tile that covers search and patch radii.
 - Reduces redundant global reads significantly.
+- Supports optional bias-corrected reconstruction.
 
 - `mse_partial_reduce_kernel(...)`
 - Parallel block reduction of squared differences.
@@ -362,6 +395,12 @@ Output estimate:
 
 $$
 \hat{I}(p) = \frac{\sum_{q \in S(p)} w(p,q)I(q)}{\sum_{q \in S(p)} w(p,q)}
+$$
+
+Bias-corrected reconstruction used when enabled:
+
+$$
+\hat{I}_{\text{rician}}(p) = \sqrt{\max\left(0, E[I^2](p) - 2\sigma^2\right)}
 $$
 
 PSNR:
@@ -448,7 +487,7 @@ Good next improvements:
 
 - Add batch-mode CLI and CSV export for all slices.
 - Add local-window SSIM implementation.
-- Add cuRAND Rician noise kernel.
+- Add optional GPU-side Gaussian noise synthesis for batch benchmarks.
 - Add CUDA graph or stream-based overlap for transfer/compute.
 - Add half precision experiments for memory-bound phases.
 
